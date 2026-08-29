@@ -241,7 +241,17 @@ function apiGetBrands() {
   return apiClient.request("/brands");
 }
 
-/** @param {{name: string, description?: string, brand_id?: string}} churchData */
+/** @param {{name: string, slug: string, description?: string, logo_media_id?: string}} brandData */
+function apiCreateBrand(brandData) {
+  return apiClient.request("/brands", { method: "POST", body: brandData });
+}
+
+/**
+ * @param {{brand_id: string, name: string, slug: string, description?: string,
+ *   location_text?: string, latitude?: number, longitude?: number, cover_media_id?: string}} churchData
+ * brand_id and slug are REQUIRED by the real ChurchCreate schema — this
+ * isn't optional metadata, the request 422s without them.
+ */
 function apiCreateChurch(churchData) {
   return apiClient.request("/churches", { method: "POST", body: churchData });
 }
@@ -303,7 +313,7 @@ function apiJoinChurch(churchId) {
   return apiClient.request(`/churches/${churchId}/join`, { method: "POST" });
 }
 
-/** @param {string} churchId @param {{content: string}} data */
+/** @param {string} churchId @param {{body?: string, media_id?: string}} data */
 function apiSendGcMessage(churchId, data) {
   return apiClient.request(`/churches/${churchId}/gc/messages`, {
     method: "POST",
@@ -348,8 +358,9 @@ function apiUploadMedia(file) {
 
 /**
  * @param {string} churchId
- * @param {{content?: string, media_id?: string}} data
- * Field names are a best guess at StoryCreate — swap if your real schema differs.
+ * @param {{media_id: string, caption?: string}} data
+ * media_id is REQUIRED by the real StoryCreate schema — the API doesn't
+ * support text-only stories.
  */
 function apiCreateStory(churchId, data) {
   return apiClient.request(`/churches/${churchId}/stories`, {
@@ -364,6 +375,7 @@ function apiListActiveStories(churchId) {
   return apiClient.request(`/churches/${churchId}/stories`);
 }
 
+/** @param {string} churchId @param {{body?: string, visibility?: string, media_ids?: string[]}} data */
 function apiCreatePost(churchId, data) {
   return apiClient.request(`/churches/${churchId}/posts`, {
     method: "POST",
@@ -377,6 +389,32 @@ function apiLikePost(postId) {
 
 function apiUnlikePost(postId) {
   return apiClient.request(`/posts/${postId}/like`, { method: "DELETE" });
+}
+
+// PostOut has NO like_count/liked_by_me fields at all — likes live behind
+// their own two endpoints and have to be fetched per post.
+function apiGetLikeCount(postId) {
+  return apiClient.request(`/posts/${postId}/likes/count`);
+}
+
+function apiHasLiked(postId) {
+  return apiClient.request(`/posts/${postId}/likes/me`);
+}
+
+// =====================================================================
+// 1B. DISPLAY HELPERS
+// =====================================================================
+//
+// IMPORTANT GAP IN THE API: there is no endpoint anywhere in the spec that
+// returns another user's display name. UserOut (name/email/phone) only
+// comes back from GET /auth/me — your OWN account. Posts (author_user_id),
+// group chat messages (author_user_id), and memberships (user_id) all give
+// you an id and nothing else. So anywhere this app shows "who posted this"
+// for someone other than yourself, it can only show a short id, not a
+// name — until the backend adds something like GET /users/{id}/profile.
+function shortId(id, fallback = "Member") {
+  if (!id) return fallback;
+  return `${fallback} #${String(id).slice(-4)}`;
 }
 
 // =====================================================================
@@ -715,10 +753,43 @@ function RegisterPage() {
 // 5. POST CARD
 // =====================================================================
 
+/**
+ * PostOut has NO author name, no like_count, no liked_by_me — only
+ * { id, church_id, author_user_id, body, visibility, created_at }. So this
+ * component fetches its own like count + like status on mount (two extra
+ * requests per post, since there's no bulk endpoint for that), and shows
+ * a short id instead of a name (see the shortId() note above).
+ */
 function PostCard({ post, onLikeChange }) {
-  const [liked, setLiked] = useState(Boolean(post.liked_by_me));
-  const [likeCount, setLikeCount] = useState(post.like_count ?? 0);
+  const [liked, setLiked] = useState(false);
+  const [likeCount, setLikeCount] = useState(0);
+  const [likeStateLoaded, setLikeStateLoaded] = useState(false);
   const [pending, setPending] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([apiGetLikeCount(post.id), apiHasLiked(post.id)])
+      .then(([countResult, hasLikedResult]) => {
+        if (cancelled) return;
+        // Both endpoints' response schemas are untyped ({} in the spec) —
+        // handle either a bare value or a {count}/{liked} wrapper.
+        const count =
+          typeof countResult === "number" ? countResult : countResult?.count ?? 0;
+        const hasLiked =
+          typeof hasLikedResult === "boolean" ? hasLikedResult : Boolean(hasLikedResult?.liked);
+        setLikeCount(count);
+        setLiked(hasLiked);
+      })
+      .catch(() => {
+        /* Non-fatal — the like button still works, it just starts at 0/unliked. */
+      })
+      .finally(() => {
+        if (!cancelled) setLikeStateLoaded(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [post.id]);
 
   async function handleToggleLike() {
     if (pending) return;
@@ -750,7 +821,7 @@ function PostCard({ post, onLikeChange }) {
     <article className="rounded-xl bg-white p-4 shadow-sm ring-1 ring-black/5">
       <header className="mb-2 flex items-center justify-between">
         <span className="text-sm font-semibold text-[#17212B]">
-          {post.author_name || "Community member"}
+          {shortId(post.author_user_id)}
         </span>
         {post.created_at && (
           <time className="text-xs text-[#17212B]/50" dateTime={post.created_at}>
@@ -760,14 +831,14 @@ function PostCard({ post, onLikeChange }) {
       </header>
 
       <p className="whitespace-pre-wrap text-sm leading-relaxed text-[#17212B]">
-        {post.content}
+        {post.body}
       </p>
 
       <footer className="mt-3 flex items-center gap-2">
         <button
           type="button"
           onClick={handleToggleLike}
-          disabled={pending}
+          disabled={pending || !likeStateLoaded}
           aria-pressed={liked}
           className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-70 ${
             liked ? "bg-[#D9A72A] text-[#17212B]" : "bg-[#174A7E] text-white hover:opacity-90"
@@ -805,7 +876,7 @@ function CreatePostForm({ churchId, onPostCreated }) {
 
     setSubmitting(true);
     try {
-      const newPost = await apiCreatePost(churchId, { content: trimmed });
+      const newPost = await apiCreatePost(churchId, { body: trimmed, visibility: "church_only" });
       setContent("");
       onPostCreated?.(newPost);
     } catch (err) {
@@ -847,11 +918,23 @@ function CreatePostForm({ churchId, onPostCreated }) {
 // 7. FEED PAGE
 // =====================================================================
 
+/**
+ * UserOut has no "home church" field at all — a user's church memberships
+ * only exist as separate MembershipOut rows (from GET /users/{id}/churches),
+ * and the API lets someone belong to more than one church. So instead of
+ * assuming a single church, this page loads the user's ACTIVE memberships,
+ * fetches each church's name (MembershipOut only has a church_id, not a
+ * name), and — if there's more than one — lets them pick which church to
+ * post into.
+ */
 function FeedPage() {
   const { user, logout } = useAuth();
   const [posts, setPosts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+
+  const [myChurches, setMyChurches] = useState([]); // [{ id, name }]
+  const [selectedChurchId, setSelectedChurchId] = useState("");
 
   const loadFeed = useCallback(async () => {
     setLoading(true);
@@ -869,6 +952,39 @@ function FeedPage() {
   useEffect(() => {
     loadFeed();
   }, [loadFeed]);
+
+  // Load which churches this user actively belongs to, with names.
+  useEffect(() => {
+    if (!user?.id) return;
+    let cancelled = false;
+
+    apiGetUserChurchHistory(user.id)
+      .then(async (history) => {
+        const activeIds = (Array.isArray(history) ? history : [])
+          .filter((m) => !m.left_at && m.status !== "removed")
+          .map((m) => m.church_id);
+
+        const churches = await Promise.all(
+          activeIds.map((id) =>
+            apiGetChurch(id)
+              .then((c) => ({ id, name: c?.name || id }))
+              .catch(() => ({ id, name: id }))
+          )
+        );
+
+        if (!cancelled) {
+          setMyChurches(churches);
+          if (churches.length > 0) setSelectedChurchId(churches[0].id);
+        }
+      })
+      .catch(() => {
+        /* Non-fatal — the page just won't offer a "post" box. */
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.id]);
 
   function handlePostCreated(newPost) {
     setPosts((prev) => [newPost, ...prev]);
@@ -896,19 +1012,41 @@ function FeedPage() {
       </header>
 
       <main className="mx-auto flex max-w-xl flex-col gap-4 px-4 py-6 sm:px-6">
-        {user?.church_id ? (
+        {selectedChurchId ? (
           <>
-            <CreatePostForm churchId={user.church_id} onPostCreated={handlePostCreated} />
+            {myChurches.length > 1 && (
+              <label className="block">
+                <span className="mb-1 block text-xs font-medium uppercase tracking-wide text-[#17212B]/50">
+                  Post as
+                </span>
+                <select
+                  value={selectedChurchId}
+                  onChange={(e) => setSelectedChurchId(e.target.value)}
+                  className="w-full rounded-lg border border-[#17212B]/15 bg-white px-3 py-2 text-sm text-[#17212B] outline-none focus:border-[#174A7E] focus:ring-2 focus:ring-[#174A7E]/20"
+                >
+                  {myChurches.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+
+            <CreatePostForm churchId={selectedChurchId} onPostCreated={handlePostCreated} />
             <Link
-              to={`/churches/${user.church_id}/timeline`}
+              to={`/churches/${selectedChurchId}/timeline`}
               className="text-center text-sm font-medium text-[#174A7E] hover:underline"
             >
-              View my church's full timeline →
+              View this church's full timeline →
             </Link>
           </>
         ) : (
           <p className="rounded-lg bg-white/60 p-3 text-center text-xs text-[#17212B]/60 ring-1 ring-black/5">
-            Join a church to post to the feed.
+            <Link to="/churches" className="font-medium text-[#174A7E] hover:underline">
+              Join a church
+            </Link>{" "}
+            to post to the feed.
           </p>
         )}
 
@@ -1020,7 +1158,27 @@ function ChurchTimelinePage() {
     setPosts((prev) => [newPost, ...prev]);
   }
 
-  const isOwnChurch = user?.church_id === churchId;
+  // UserOut has no "home church" field — determine membership from the
+  // user's actual church history instead of a field that doesn't exist.
+  const [isOwnChurch, setIsOwnChurch] = useState(false);
+  useEffect(() => {
+    if (!user?.id) return;
+    let cancelled = false;
+    apiGetUserChurchHistory(user.id)
+      .then((history) => {
+        if (cancelled) return;
+        const active = (Array.isArray(history) ? history : []).some(
+          (m) => m.church_id === churchId && !m.left_at && m.status !== "removed"
+        );
+        setIsOwnChurch(active);
+      })
+      .catch(() => {
+        /* Non-fatal — Manage/post-composer links just won't show. */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.id, churchId]);
 
   return (
     <div className="min-h-screen bg-[#EEF5FB] pb-16">
@@ -1379,21 +1537,13 @@ function LandingPage() {
                 heroPosts.map((post) => (
                   <div key={post.id} className="rounded-lg bg-white p-2 shadow-sm">
                     <p className="line-clamp-2 text-[9px] leading-snug text-[#17212B]/75">
-                      {post.content}
+                      {post.body}
                     </p>
                     <p className="mt-1 truncate text-[8px] font-medium text-[#17212B]/40">
-                      {post.author_name || "Community member"}
+                      {shortId(post.author_user_id)}
                     </p>
                   </div>
                 ))}
-
-              {!heroFeedLoading && heroPosts.length > 0 && (
-                <div className="flex gap-1.5">
-                  <span className="rounded-full bg-[#D9A72A]/20 px-2 py-0.5 text-[8px] font-medium text-[#17212B]">
-                    ★ {heroPosts[0].like_count ?? 0}
-                  </span>
-                </div>
-              )}
             </PhoneMock>
 
             <PhoneMock label="Bible Hub · Preview" accent="#174A7E" className="hidden rotate-6 translate-y-4 sm:block">
@@ -1665,6 +1815,7 @@ const AVATAR_STORAGE_PREFIX = "faithconnect_avatar_";
 function ProfilePage() {
   const { user, logout } = useAuth();
   const [history, setHistory] = useState([]);
+  const [churchNames, setChurchNames] = useState({}); // church_id -> name
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
@@ -1715,8 +1866,22 @@ function ProfilePage() {
     setLoading(true);
     setError("");
     apiGetUserChurchHistory(user.id)
-      .then((data) => {
-        if (!cancelled) setHistory(Array.isArray(data) ? data : []);
+      .then(async (data) => {
+        const rows = Array.isArray(data) ? data : [];
+        if (cancelled) return;
+        setHistory(rows);
+
+        // MembershipOut only has church_id, no name — fetch each unique
+        // church's real name (confirmed field on ChurchOut) in parallel.
+        const uniqueIds = [...new Set(rows.map((m) => m.church_id))];
+        const entries = await Promise.all(
+          uniqueIds.map((id) =>
+            apiGetChurch(id)
+              .then((c) => [id, c?.name])
+              .catch(() => [id, null])
+          )
+        );
+        if (!cancelled) setChurchNames(Object.fromEntries(entries));
       })
       .catch((err) => {
         if (!cancelled) setError(err?.message || "Couldn't load your church history.");
@@ -1730,9 +1895,7 @@ function ProfilePage() {
     };
   }, [user?.id]);
 
-  // Split into active vs past memberships. Adjust the field name below
-  // (`is_active` / `left_at` / `status`) to match your real MembershipOut
-  // schema once you can see a sample response.
+  // Confirmed against the real MembershipOut schema: status/left_at both exist.
   const activeMemberships = history.filter((m) => !m.left_at && m.status !== "removed");
   const pastMemberships = history.filter((m) => m.left_at || m.status === "removed");
 
@@ -1822,7 +1985,7 @@ function ProfilePage() {
                       to={`/churches/${m.church_id}/timeline`}
                       className="text-sm font-medium text-[#174A7E] hover:underline"
                     >
-                      {m.church_name || m.church_id}
+                      {churchNames[m.church_id] || m.church_id}
                     </Link>
                     <span className="rounded-full bg-[#D9A72A]/15 px-2 py-0.5 text-xs font-medium text-[#17212B]">
                       Member
@@ -1842,7 +2005,7 @@ function ProfilePage() {
                 {pastMemberships.map((m) => (
                   <li key={m.id || m.church_id} className="flex items-center justify-between py-2.5">
                     <span className="text-sm text-[#17212B]/60">
-                      {m.church_name || m.church_id}
+                      {churchNames[m.church_id] || m.church_id}
                     </span>
                     <span className="text-xs text-[#17212B]/40">Left</span>
                   </li>
@@ -2010,7 +2173,7 @@ function BrowseChurchesPage() {
                       >
                         {church.name}
                       </Link>
-                      {church.verified && (
+                      {church.is_verified && (
                         <span className="shrink-0 rounded-full bg-[#D9A72A]/20 px-2 py-0.5 text-[10px] font-semibold text-[#17212B]">
                           Verified
                         </span>
@@ -2144,7 +2307,7 @@ function GroupChatPage() {
     setSending(true);
     setError("");
     try {
-      const newMessage = await apiSendGcMessage(churchId, { content: trimmed });
+      const newMessage = await apiSendGcMessage(churchId, { body: trimmed });
       setMessages((prev) => [...prev, newMessage]);
       setDraft("");
       requestAnimationFrame(() => bottomRef.current?.scrollIntoView({ block: "end" }));
@@ -2218,7 +2381,7 @@ function GroupChatPage() {
 
           {!loading &&
             messages.map((msg) => {
-              const isOwn = msg.author_id === user?.id || msg.user_id === user?.id;
+              const isOwn = msg.author_user_id === user?.id;
               return (
                 <div key={msg.id} className={`flex ${isOwn ? "justify-end" : "justify-start"}`}>
                   <div
@@ -2228,10 +2391,10 @@ function GroupChatPage() {
                   >
                     {!isOwn && (
                       <p className="mb-0.5 text-xs font-semibold opacity-70">
-                        {msg.author_name || "Member"}
+                        {shortId(msg.author_user_id)}
                       </p>
                     )}
-                    <p className="whitespace-pre-wrap leading-relaxed">{msg.content}</p>
+                    <p className="whitespace-pre-wrap leading-relaxed">{msg.body}</p>
                     <div className="mt-1 flex items-center justify-between gap-3">
                       {msg.created_at && (
                         <time
@@ -2293,13 +2456,20 @@ const STORY_DURATION_MS = 5000;
 
 /**
  * Protected, church-scoped stories page: a tray of thumbnails up top, a
- * full-screen tap-through viewer, and a form to post a new story (caption
- * + optional image, uploaded via /uploads then attached by media id).
+ * full-screen tap-through viewer, and a form to post a new story.
  * Route: /churches/:churchId/stories
  *
- * FIELD-NAME ASSUMPTION: StoryCreate's shape isn't in the spec we have —
- * this sends { content, media_id }. Swap those keys if your real schema
- * calls them something else once you see a StoryCreate example or a 422.
+ * TWO REAL CONSTRAINTS FROM THE CONFIRMED SCHEMA:
+ * 1. StoryCreate requires `media_id` — the API has no text-only stories,
+ *    so the photo picker below is mandatory, not optional.
+ * 2. StoryOut only returns `media_id` (an id), never a URL. There is no
+ *    GET /media/{id} endpoint in the spec to resolve that id back into a
+ *    displayable image. So only stories uploaded THIS session — where we
+ *    still have the URL the upload endpoint just handed us — can actually
+ *    show a photo; the mediaUrlCache below holds those. Stories loaded
+ *    from the server (yours from an earlier session, or anyone else's)
+ *    show a plain avatar placeholder with the caption instead of a broken
+ *    image, since there's genuinely no way to fetch their photo yet.
  */
 function StoriesPage() {
   const { churchId } = useParams();
@@ -2308,6 +2478,9 @@ function StoriesPage() {
   const [stories, setStories] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+
+  // media_id -> url, populated only for uploads made in this session.
+  const [mediaUrlCache, setMediaUrlCache] = useState({});
 
   const [viewerIndex, setViewerIndex] = useState(null); // null = viewer closed
   const [progress, setProgress] = useState(0);
@@ -2379,24 +2552,25 @@ function StoriesPage() {
 
   async function handlePostStory(e) {
     e.preventDefault();
-    const trimmed = caption.trim();
-    if (!trimmed && !file) {
-      setFormError("Add a caption or an image.");
+    if (!file) {
+      setFormError("A photo is required — the API doesn't support text-only stories.");
       return;
     }
 
     setPosting(true);
     setFormError("");
     try {
-      let mediaId;
-      if (file) {
-        const media = await apiUploadMedia(file);
-        mediaId = media?.id;
-      }
+      const media = await apiUploadMedia(file);
+      const mediaId = media?.id;
       const newStory = await apiCreateStory(churchId, {
-        content: trimmed || undefined,
         media_id: mediaId,
+        caption: caption.trim() || undefined,
       });
+      // We have the real URL from THIS upload — cache it so the tray/viewer
+      // can actually show it (see the constraint note above).
+      if (media?.url && mediaId) {
+        setMediaUrlCache((prev) => ({ ...prev, [mediaId]: media.url }));
+      }
       setStories((prev) => [newStory, ...prev]);
       setCaption("");
       setFile(null);
@@ -2440,27 +2614,30 @@ function StoriesPage() {
           )}
 
           {!loading &&
-            stories.map((story, index) => (
-              <button
-                key={story.id}
-                type="button"
-                onClick={() => setViewerIndex(index)}
-                className="flex shrink-0 flex-col items-center gap-1.5"
-              >
-                <span className="flex h-16 w-16 items-center justify-center overflow-hidden rounded-full ring-2 ring-[#D9A72A] ring-offset-2">
-                  {story.media_url ? (
-                    <img src={story.media_url} alt="" className="h-full w-full object-cover" />
-                  ) : (
-                    <span className="flex h-full w-full items-center justify-center bg-[#174A7E] text-lg font-semibold text-white">
-                      {(story.author_name || "?").charAt(0).toUpperCase()}
-                    </span>
-                  )}
-                </span>
-                <span className="max-w-[4rem] truncate text-xs text-[#17212B]/60">
-                  {story.author_name || "Member"}
-                </span>
-              </button>
-            ))}
+            stories.map((story, index) => {
+              const cachedUrl = mediaUrlCache[story.media_id];
+              return (
+                <button
+                  key={story.id}
+                  type="button"
+                  onClick={() => setViewerIndex(index)}
+                  className="flex shrink-0 flex-col items-center gap-1.5"
+                >
+                  <span className="flex h-16 w-16 items-center justify-center overflow-hidden rounded-full ring-2 ring-[#D9A72A] ring-offset-2">
+                    {cachedUrl ? (
+                      <img src={cachedUrl} alt="" className="h-full w-full object-cover" />
+                    ) : (
+                      <span className="flex h-full w-full items-center justify-center bg-[#174A7E] text-lg font-semibold text-white">
+                        {story.author_user_id ? story.author_user_id.slice(-1).toUpperCase() : "?"}
+                      </span>
+                    )}
+                  </span>
+                  <span className="max-w-[4rem] truncate text-xs text-[#17212B]/60">
+                    {shortId(story.author_user_id)}
+                  </span>
+                </button>
+              );
+            })}
         </div>
 
         {!loading && error && (
@@ -2492,23 +2669,25 @@ function StoriesPage() {
           >
             <h2 className="mb-3 text-sm font-semibold text-[#17212B]">New story</h2>
 
-            <textarea
-              value={caption}
-              onChange={(e) => setCaption(e.target.value)}
-              placeholder="Say something about this moment…"
-              rows={3}
-              className="w-full resize-none rounded-lg border border-[#17212B]/15 p-3 text-sm text-[#17212B] outline-none focus:border-[#174A7E] focus:ring-2 focus:ring-[#174A7E]/20"
-            />
-
-            <label className="mt-3 block text-xs font-medium text-[#17212B]/60">
-              Photo (optional)
+            <label className="block text-xs font-medium text-[#17212B]/60">
+              Photo <span className="text-red-500">*</span> — required, the API doesn't
+              support text-only stories
               <input
                 type="file"
                 accept="image/*"
+                required
                 onChange={(e) => setFile(e.target.files?.[0] || null)}
                 className="mt-1 block w-full text-xs text-[#17212B]/70"
               />
             </label>
+
+            <textarea
+              value={caption}
+              onChange={(e) => setCaption(e.target.value)}
+              placeholder="Add a caption (optional)…"
+              rows={2}
+              className="mt-3 w-full resize-none rounded-lg border border-[#17212B]/15 p-3 text-sm text-[#17212B] outline-none focus:border-[#174A7E] focus:ring-2 focus:ring-[#174A7E]/20"
+            />
 
             {formError && <p className="mt-2 text-sm text-red-600">{formError}</p>}
 
@@ -2522,7 +2701,7 @@ function StoriesPage() {
               </button>
               <button
                 type="submit"
-                disabled={posting}
+                disabled={posting || !file}
                 className="rounded-lg bg-[#D9A72A] px-4 py-2 text-sm font-semibold text-[#17212B] hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {posting ? "Posting…" : "Post story"}
@@ -2559,7 +2738,7 @@ function StoriesPage() {
           </button>
 
           <p className="absolute left-4 top-8 text-sm font-medium text-white/90">
-            {activeStory.author_name || "Member"}
+            {shortId(activeStory.author_user_id)}
           </p>
 
           {/* Tap zones for prev/next */}
@@ -2577,16 +2756,20 @@ function StoriesPage() {
           />
 
           <div className="flex max-h-full max-w-full flex-col items-center justify-center px-6 text-center">
-            {activeStory.media_url && (
+            {mediaUrlCache[activeStory.media_id] ? (
               <img
-                src={activeStory.media_url}
+                src={mediaUrlCache[activeStory.media_id]}
                 alt=""
                 className="max-h-[70vh] rounded-lg object-contain"
               />
+            ) : (
+              <div className="flex h-48 w-48 items-center justify-center rounded-2xl bg-white/10 text-sm text-white/50">
+                Photo unavailable
+              </div>
             )}
-            {activeStory.content && (
+            {activeStory.caption && (
               <p className="mt-4 max-w-sm text-base leading-relaxed text-white">
-                {activeStory.content}
+                {activeStory.caption}
               </p>
             )}
           </div>
@@ -2606,26 +2789,85 @@ function StoriesPage() {
  * first member and can manage it from there.
  * Route: /churches/new
  */
+function slugify(text) {
+  return text
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "");
+}
+
+/**
+ * ChurchCreate requires BOTH brand_id and slug — a church can't exist
+ * without belonging to a brand/network. Since there's no separate
+ * "create a network" page yet, this form lets you pick an existing brand
+ * or create one inline (via the real POST /brands endpoint) if none fit.
+ */
 function CreateChurchPage() {
   const navigate = useNavigate();
+
+  const [brands, setBrands] = useState([]);
+  const [brandsLoading, setBrandsLoading] = useState(true);
+  const [selectedBrandId, setSelectedBrandId] = useState("");
+  const [creatingNewBrand, setCreatingNewBrand] = useState(false);
+  const [newBrandName, setNewBrandName] = useState("");
+
   const [name, setName] = useState("");
+  const [slug, setSlug] = useState("");
+  const [slugEdited, setSlugEdited] = useState(false);
   const [description, setDescription] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
 
+  useEffect(() => {
+    apiGetBrands()
+      .then((data) => {
+        const list = Array.isArray(data) ? data : [];
+        setBrands(list);
+        if (list.length === 0) setCreatingNewBrand(true);
+        else setSelectedBrandId(list[0].id);
+      })
+      .catch(() => setCreatingNewBrand(true))
+      .finally(() => setBrandsLoading(false));
+  }, []);
+
+  // Auto-fill the slug from the name unless the person has typed their own.
+  function handleNameChange(value) {
+    setName(value);
+    if (!slugEdited) setSlug(slugify(value));
+  }
+
   async function handleSubmit(e) {
     e.preventDefault();
     const trimmedName = name.trim();
-    if (!trimmedName) {
-      setError("Give your church a name.");
+    const trimmedSlug = slug.trim();
+
+    if (!trimmedName || !trimmedSlug) {
+      setError("A church needs both a name and a URL slug.");
+      return;
+    }
+    if (creatingNewBrand && !newBrandName.trim()) {
+      setError("Give the network a name too.");
       return;
     }
 
     setSubmitting(true);
     setError("");
     try {
+      let brandId = selectedBrandId;
+      if (creatingNewBrand) {
+        const brandNameTrimmed = newBrandName.trim();
+        const brand = await apiCreateBrand({
+          name: brandNameTrimmed,
+          slug: slugify(brandNameTrimmed),
+        });
+        brandId = brand.id;
+      }
+
       const church = await apiCreateChurch({
+        brand_id: brandId,
         name: trimmedName,
+        slug: trimmedSlug,
         description: description.trim() || undefined,
       });
       navigate(`/churches/${church.id}/manage`, { replace: true });
@@ -2650,14 +2892,78 @@ function CreateChurchPage() {
           onSubmit={handleSubmit}
           className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-black/5"
         >
+          {/* ---- Brand / network ---- */}
+          <label className="mb-4 block">
+            <span className="mb-1 block text-sm font-medium text-[#17212B]">Network</span>
+            {brandsLoading ? (
+              <p className="text-sm text-[#17212B]/50">Loading networks…</p>
+            ) : creatingNewBrand ? (
+              <div className="space-y-2">
+                <input
+                  type="text"
+                  value={newBrandName}
+                  onChange={(e) => setNewBrandName(e.target.value)}
+                  className="w-full rounded-lg border border-[#17212B]/15 px-3 py-2 text-sm text-[#17212B] outline-none focus:border-[#174A7E] focus:ring-2 focus:ring-[#174A7E]/20"
+                  placeholder="New network name (e.g. your denomination or ministry)"
+                />
+                {brands.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setCreatingNewBrand(false)}
+                    className="text-xs font-medium text-[#174A7E] hover:underline"
+                  >
+                    Use an existing network instead
+                  </button>
+                )}
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <select
+                  value={selectedBrandId}
+                  onChange={(e) => setSelectedBrandId(e.target.value)}
+                  className="w-full rounded-lg border border-[#17212B]/15 bg-white px-3 py-2 text-sm text-[#17212B] outline-none focus:border-[#174A7E] focus:ring-2 focus:ring-[#174A7E]/20"
+                >
+                  {brands.map((brand) => (
+                    <option key={brand.id} value={brand.id}>
+                      {brand.name}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={() => setCreatingNewBrand(true)}
+                  className="text-xs font-medium text-[#174A7E] hover:underline"
+                >
+                  + Create a new network instead
+                </button>
+              </div>
+            )}
+          </label>
+
           <label className="mb-4 block">
             <span className="mb-1 block text-sm font-medium text-[#17212B]">Church name</span>
             <input
               type="text"
               value={name}
-              onChange={(e) => setName(e.target.value)}
+              onChange={(e) => handleNameChange(e.target.value)}
               className="w-full rounded-lg border border-[#17212B]/15 px-3 py-2 text-sm text-[#17212B] outline-none focus:border-[#174A7E] focus:ring-2 focus:ring-[#174A7E]/20"
               placeholder="Grace Community Church"
+            />
+          </label>
+
+          <label className="mb-4 block">
+            <span className="mb-1 block text-sm font-medium text-[#17212B]">
+              URL slug <span className="text-[#17212B]/40">(auto-filled, editable)</span>
+            </span>
+            <input
+              type="text"
+              value={slug}
+              onChange={(e) => {
+                setSlugEdited(true);
+                setSlug(e.target.value);
+              }}
+              className="w-full rounded-lg border border-[#17212B]/15 px-3 py-2 text-sm text-[#17212B] outline-none focus:border-[#174A7E] focus:ring-2 focus:ring-[#174A7E]/20"
+              placeholder="grace-community-church"
             />
           </label>
 
@@ -2865,10 +3171,10 @@ function ManageChurchPage() {
                 <div>
                   <h2 className="text-sm font-semibold text-[#17212B]">Verification</h2>
                   <p className="mt-0.5 text-xs text-[#17212B]/50">
-                    {church?.verified ? "This church is verified." : "Not yet verified."}
+                    {church?.is_verified ? "This church is verified." : "Not yet verified."}
                   </p>
                 </div>
-                {!church?.verified && (
+                {!church?.is_verified && (
                   <button
                     type="button"
                     onClick={handleVerify}
@@ -2891,7 +3197,7 @@ function ManageChurchPage() {
                 {members.map((m) => (
                   <li key={m.user_id} className="flex items-center justify-between py-2.5">
                     <span className="truncate text-sm text-[#17212B]">
-                      {m.user_name || m.user_id}
+                      {shortId(m.user_id)}
                     </span>
                     <button
                       type="button"
@@ -2970,7 +3276,7 @@ function ManageChurchPage() {
                     <option value="">Assign tag to…</option>
                     {members.map((m) => (
                       <option key={m.user_id} value={m.user_id}>
-                        {m.user_name || m.user_id}
+                        {shortId(m.user_id)}
                       </option>
                     ))}
                   </select>
